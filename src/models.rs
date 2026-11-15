@@ -7,9 +7,16 @@ pub struct UsageSection {
 }
 
 #[derive(Clone, Debug, Default)]
+pub struct UsagePool {
+    pub session: UsageSection,
+    pub weekly: UsageSection,
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct UsageData {
     pub session: UsageSection,
     pub weekly: UsageSection,
+    pub extra_pools: Vec<UsagePool>,
 }
 
 #[derive(Clone, Debug, Default)]

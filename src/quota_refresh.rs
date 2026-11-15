@@ -217,6 +217,7 @@ mod tests {
                 percentage: weekly,
                 resets_at: None,
             },
+            extra_pools: Vec::new(),
         }
     }
     #[test]

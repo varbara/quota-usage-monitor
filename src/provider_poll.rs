@@ -64,6 +64,11 @@ fn watch_mode(id: usize, error: PollError) -> CredentialWatchMode {
 fn next_reset_ms(data: &UsageData, wall: SystemTime) -> Option<u32> {
     [data.session.resets_at, data.weekly.resets_at]
         .into_iter()
+        .chain(
+            data.extra_pools
+                .iter()
+                .flat_map(|pool| [pool.session.resets_at, pool.weekly.resets_at]),
+        )
         .flatten()
         .filter_map(|time| time.duration_since(wall).ok())
         .filter(|delay| !delay.is_zero())
@@ -236,6 +241,11 @@ impl Monitor {
                 s.retry_not_before = None;
                 let reset = [data.session.resets_at, data.weekly.resets_at]
                     .into_iter()
+                    .chain(
+                        data.extra_pools
+                            .iter()
+                            .flat_map(|pool| [pool.session.resets_at, pool.weekly.resets_at]),
+                    )
                     .flatten()
                     .filter(|t| *t <= wall)
                     .max();

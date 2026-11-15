@@ -14,7 +14,7 @@ use std::os::windows::process::CommandExt;
 
 use crate::diagnose;
 use crate::localization::Strings;
-use crate::models::{UsageData, UsageSection};
+use crate::models::{UsageData, UsagePool, UsageSection};
 use crate::native_interop;
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
@@ -1031,13 +1031,7 @@ fn fetch_antigravity_usage_from_endpoint(
         }
     }
 
-    let session = fetch_antigravity_model_quota(base_url, token, project.as_deref())?;
-    let weekly = UsageSection::default();
-
-    Ok(UsageData {
-        session,
-        weekly,
-    })
+    fetch_antigravity_model_quota(base_url, token, project.as_deref())
 }
 
 fn fetch_antigravity_project(base_url: &str, token: &str) -> Result<Option<String>, PollError> {
@@ -1052,7 +1046,10 @@ fn fetch_antigravity_project(base_url: &str, token: &str) -> Result<Option<Strin
         .post(&format!("{base_url}/v1internal:loadCodeAssist"))
         .set("Authorization", &format!("Bearer {token}"))
         .set("Content-Type", "application/json")
-        .set("User-Agent", "antigravity")
+        .set(
+            "User-Agent",
+            "antigravity/2.25.0 (aidev_client; os_type=windows; arch=amd64; cl=1003475615)",
+        )
         .send_json(&body)
     {
         Ok(resp) => resp,
@@ -1078,7 +1075,7 @@ fn fetch_antigravity_model_quota(
     base_url: &str,
     token: &str,
     project: Option<&str>,
-) -> Result<UsageSection, PollError> {
+) -> Result<UsageData, PollError> {
     let agent = build_agent()?;
     let body = match project {
         Some(project) => serde_json::json!({ "project": project }),
@@ -1089,7 +1086,10 @@ fn fetch_antigravity_model_quota(
         .post(&format!("{base_url}/v1internal:fetchAvailableModels"))
         .set("Authorization", &format!("Bearer {token}"))
         .set("Content-Type", "application/json")
-        .set("User-Agent", "antigravity")
+        .set(
+            "User-Agent",
+            "antigravity/2.25.0 (aidev_client; os_type=windows; arch=amd64; cl=1003475615)",
+        )
         .send_json(&body)
     {
         Ok(resp) => resp,
@@ -1111,14 +1111,49 @@ fn fetch_antigravity_model_quota(
         }
     };
 
-    best_antigravity_section(response.models.into_iter().filter_map(|(model, info)| {
-        let quota = info.quota_info?;
-        if !is_antigravity_display_model(&model) {
-            return None;
-        }
-        antigravity_section_from_quota(quota)
+    let entries: Vec<(String, UsageSection)> = response
+        .models
+        .into_iter()
+        .filter_map(|(model, info)| {
+            let quota = info.quota_info?;
+            Some((model, antigravity_section_from_quota(quota)?))
+        })
+        .collect();
+
+    let gemini = best_antigravity_section(entries.iter().filter_map(|(model, section)| {
+        antigravity_family_matches(model, AntigravityFamily::Gemini).then(|| section.clone())
     }))
-    .ok_or(PollError::RequestFailed)
+    .or_else(|| {
+        best_antigravity_section(entries.iter().filter_map(|(model, section)| {
+            is_antigravity_display_model(model).then(|| section.clone())
+        }))
+    })
+    .ok_or(PollError::RequestFailed)?;
+
+    let claude = best_antigravity_section(entries.iter().filter_map(|(model, section)| {
+        antigravity_family_matches(model, AntigravityFamily::Claude).then(|| section.clone())
+    }))
+    .unwrap_or_default();
+
+    let other = best_antigravity_section(entries.iter().filter_map(|(model, section)| {
+        antigravity_family_matches(model, AntigravityFamily::Other).then(|| section.clone())
+    }))
+    .unwrap_or_default();
+
+    Ok(UsageData {
+        session: gemini,
+        weekly: UsageSection::default(),
+        extra_pools: vec![
+            UsagePool {
+                session: claude,
+                weekly: UsageSection::default(),
+            },
+            UsagePool {
+                session: other,
+                weekly: UsageSection::default(),
+            },
+        ],
+    })
 }
 
 fn fetch_antigravity_quota_summary(
@@ -1133,7 +1168,10 @@ fn fetch_antigravity_quota_summary(
         .post(&format!("{base_url}/v1internal:retrieveUserQuotaSummary"))
         .set("Authorization", &format!("Bearer {token}"))
         .set("Content-Type", "application/json")
-        .set("User-Agent", "antigravity")
+        .set(
+            "User-Agent",
+            "antigravity/2.25.0 (aidev_client; os_type=windows; arch=amd64; cl=1003475615)",
+        )
         .send_json(&body)
     {
         Ok(resp) => resp,
@@ -1158,6 +1196,28 @@ fn fetch_antigravity_quota_summary(
     antigravity_usage_from_summary(response).ok_or(PollError::RequestFailed)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AntigravityFamily {
+    Gemini,
+    Claude,
+    Other,
+}
+
+fn antigravity_family_matches(model: &str, family: AntigravityFamily) -> bool {
+    let name = model.to_ascii_lowercase();
+    match family {
+        AntigravityFamily::Gemini => name.starts_with("gemini"),
+        AntigravityFamily::Claude => name.starts_with("claude") || name.starts_with("gpt"),
+        AntigravityFamily::Other => {
+            !(name.starts_with("gemini")
+                || name.starts_with("claude")
+                || name.starts_with("gpt")
+                || name.starts_with("image")
+                || name.starts_with("imagen"))
+        }
+    }
+}
+
 fn antigravity_section_from_quota(quota: AntigravityQuotaInfo) -> Option<UsageSection> {
     let remaining = quota.remaining_fraction?.clamp(0.0, 1.0);
     Some(UsageSection {
@@ -1177,30 +1237,59 @@ fn antigravity_section_from_summary_bucket(
 }
 
 fn antigravity_usage_from_summary(response: AntigravityQuotaSummaryResponse) -> Option<UsageData> {
-    let mut fallback = None;
+    let primary = antigravity_usage_from_summary_for_family(&response, AntigravityFamily::Gemini)
+        .or_else(|| {
+            response
+                .groups
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .find_map(antigravity_usage_from_summary_group)
+        })?;
+    let claude = antigravity_usage_from_summary_for_family(&response, AntigravityFamily::Claude)
+        .unwrap_or_default();
+    let argon = antigravity_usage_from_summary_for_family(&response, AntigravityFamily::Other)
+        .unwrap_or_default();
 
-    for group in response.groups.unwrap_or_default() {
-        let is_gemini = is_antigravity_gemini_summary_group(&group);
-        let usage = antigravity_usage_from_summary_group(group);
-
-        if is_gemini && usage.is_some() {
-            return usage;
-        }
-
-        if fallback.is_none() {
-            fallback = usage;
-        }
-    }
-
-    fallback
+    Some(UsageData {
+        session: primary.session,
+        weekly: primary.weekly,
+        extra_pools: vec![
+            UsagePool {
+                session: claude.session,
+                weekly: claude.weekly,
+            },
+            UsagePool {
+                session: argon.session,
+                weekly: argon.weekly,
+            },
+        ],
+    })
 }
 
-fn antigravity_usage_from_summary_group(group: AntigravityQuotaSummaryGroup) -> Option<UsageData> {
+fn antigravity_usage_from_summary_for_family(
+    response: &AntigravityQuotaSummaryResponse,
+    family: AntigravityFamily,
+) -> Option<UsageData> {
+    let groups = response.groups.as_deref()?;
+    let matcher = match family {
+        AntigravityFamily::Gemini => is_antigravity_gemini_summary_group,
+        AntigravityFamily::Claude => is_antigravity_claude_summary_group,
+        AntigravityFamily::Other => is_antigravity_other_summary_group,
+    };
+
+    groups
+        .iter()
+        .find(|group| matcher(group))
+        .and_then(antigravity_usage_from_summary_group)
+}
+
+fn antigravity_usage_from_summary_group(group: &AntigravityQuotaSummaryGroup) -> Option<UsageData> {
     let mut data = UsageData::default();
     let mut has_quota = false;
 
-    for bucket in group.buckets.unwrap_or_default() {
-        let Some(section) = antigravity_section_from_summary_bucket(&bucket) else {
+    for bucket in group.buckets.as_deref().unwrap_or_default() {
+        let Some(section) = antigravity_section_from_summary_bucket(bucket) else {
             continue;
         };
 
@@ -1220,7 +1309,48 @@ fn antigravity_usage_from_summary_group(group: AntigravityQuotaSummaryGroup) -> 
     has_quota.then_some(data)
 }
 
+fn is_antigravity_argon_summary_group(group: &AntigravityQuotaSummaryGroup) -> bool {
+    group
+        .display_name
+        .as_deref()
+        .is_some_and(|name| name.to_ascii_lowercase().contains("argon"))
+        || group.buckets.as_deref().is_some_and(|buckets| {
+            buckets.iter().any(|bucket| {
+                bucket
+                    .bucket_id
+                    .as_deref()
+                    .is_some_and(|id| id.to_ascii_lowercase().contains("argon"))
+                    || bucket
+                        .display_name
+                        .as_deref()
+                        .is_some_and(|name| name.to_ascii_lowercase().contains("argon"))
+            })
+        })
+}
+
+fn is_antigravity_claude_summary_group(group: &AntigravityQuotaSummaryGroup) -> bool {
+    group
+        .display_name
+        .as_deref()
+        .is_some_and(|name| {
+            let lower = name.to_ascii_lowercase();
+            lower.contains("claude") || lower.contains("gpt")
+        })
+        || group.buckets.as_deref().is_some_and(|buckets| {
+            buckets.iter().any(|bucket| {
+                bucket
+                    .bucket_id
+                    .as_deref()
+                    .is_some_and(|id| id.to_ascii_lowercase().starts_with("3p-"))
+            })
+        })
+}
+
 fn is_antigravity_gemini_summary_group(group: &AntigravityQuotaSummaryGroup) -> bool {
+    if is_antigravity_argon_summary_group(group) || is_antigravity_claude_summary_group(group) {
+        return false;
+    }
+
     group
         .display_name
         .as_deref()
@@ -1229,7 +1359,7 @@ fn is_antigravity_gemini_summary_group(group: &AntigravityQuotaSummaryGroup) -> 
             .description
             .as_deref()
             .is_some_and(|description| description.to_ascii_lowercase().contains("gemini"))
-        || group.buckets.as_ref().is_some_and(|buckets| {
+        || group.buckets.as_deref().is_some_and(|buckets| {
             buckets.iter().any(|bucket| {
                 bucket
                     .bucket_id
@@ -1241,6 +1371,12 @@ fn is_antigravity_gemini_summary_group(group: &AntigravityQuotaSummaryGroup) -> 
                         .is_some_and(|name| name.to_ascii_lowercase().contains("gemini"))
             })
         })
+}
+
+fn is_antigravity_other_summary_group(group: &AntigravityQuotaSummaryGroup) -> bool {
+    is_antigravity_argon_summary_group(group)
+        || (!is_antigravity_gemini_summary_group(group)
+            && !is_antigravity_claude_summary_group(group))
 }
 
 fn best_antigravity_section<I>(sections: I) -> Option<UsageSection>
@@ -1362,7 +1498,11 @@ fn poll_opencode() -> Result<UsageData, PollError> {
         .unwrap_or_default();
     let weekly = select_opencode_long_window(&usage);
 
-    Ok(UsageData { session, weekly })
+    Ok(UsageData {
+        session,
+        weekly,
+        extra_pools: Vec::new(),
+    })
 }
 
 fn select_opencode_long_window(usage: &OpenCodeDashboardUsage) -> UsageSection {
@@ -1880,6 +2020,7 @@ fn cursor_usage_from_summary(response: CursorUsageSummaryResponse) -> Option<Usa
     Some(UsageData {
         session: section(plan.auto_percent_used.or(plan.total_percent_used)),
         weekly: section(plan.api_percent_used),
+        extra_pools: Vec::new(),
     })
 }
 
@@ -2105,6 +2246,7 @@ fn grok_usage_from_billing(response: GrokBillingResponse) -> Option<UsageData> {
             percentage: percentage.clamp(0.0, 100.0),
             resets_at,
         },
+        extra_pools: Vec::new(),
     })
 }
 
@@ -3062,6 +3204,7 @@ fn copilot_usage_from_user(response: CopilotUserResponse) -> Option<UsageData> {
             percentage: pool,
             resets_at,
         },
+        extra_pools: Vec::new(),
     })
 }
 
@@ -4507,5 +4650,77 @@ mod tests {
         assert!((usage.session.percentage - 4.17425).abs() < 0.000001);
         assert!(usage.weekly.resets_at.is_some());
         assert!(usage.session.resets_at.is_some());
+    }
+
+    #[test]
+    fn antigravity_summary_splits_all_three_pools() {
+        let response: AntigravityQuotaSummaryResponse = serde_json::from_str(
+            r#"{
+                "groups": [
+                    {
+                        "displayName": "Gemini Models",
+                        "buckets": [
+                            {
+                                "bucketId": "gemini-weekly",
+                                "window": "weekly",
+                                "resetTime": "2026-11-21T02:37:00Z",
+                                "remainingFraction": 0.8129669
+                            },
+                            {
+                                "bucketId": "gemini-5h",
+                                "window": "5h",
+                                "resetTime": "2026-11-15T04:29:09Z",
+                                "remainingFraction": 0.95015806
+                            }
+                        ]
+                    },
+                    {
+                        "displayName": "Claude and GPT models",
+                        "buckets": [
+                            {
+                                "bucketId": "3p-weekly",
+                                "window": "weekly",
+                                "resetTime": "2026-11-21T07:59:23Z",
+                                "remainingFraction": 0.516556
+                            },
+                            {
+                                "bucketId": "3p-5h",
+                                "window": "5h",
+                                "resetTime": "2026-11-15T04:19:35Z",
+                                "remainingFraction": 0.4958608
+                            }
+                        ]
+                    },
+                    {
+                        "displayName": "Gemini 4 Argon",
+                        "buckets": [
+                            {
+                                "bucketId": "gemini-argon-wtu-weekly",
+                                "window": "weekly",
+                                "resetTime": "2026-11-21T02:32:02Z",
+                                "remainingFraction": 0.8683079
+                            }
+                        ]
+                    }
+                ]
+            }"#,
+        )
+        .expect("3-pool summary should deserialize");
+
+        let usage =
+            antigravity_usage_from_summary(response).expect("Antigravity pools should resolve");
+        assert!((usage.session.percentage - 4.984194).abs() < 0.001);
+        assert!((usage.weekly.percentage - 18.70331).abs() < 0.001);
+        assert_eq!(usage.extra_pools.len(), 2);
+
+        let claude = &usage.extra_pools[0];
+        assert!((claude.session.percentage - 50.41392).abs() < 0.001);
+        assert!((claude.weekly.percentage - 48.3444).abs() < 0.001);
+
+        let argon = &usage.extra_pools[1];
+        assert_eq!(argon.session.percentage, 0.0);
+        assert!(argon.session.resets_at.is_none());
+        assert!((argon.weekly.percentage - 13.16921).abs() < 0.001);
+        assert!(argon.weekly.resets_at.is_some());
     }
 }
